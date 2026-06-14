@@ -54,6 +54,13 @@ pub struct AppState {
 pub struct Inner {
     pub store: Arc<dyn PersistenceProvider>,
     pub users: Arc<dyn UserDirectory>,
+    /// Client-auth scheme. SINGLE-INSTANCE ASSUMPTION: this holds a process-local
+    /// nonce replay cache and a per-process enroll/bootstrap lock, so the API must
+    /// run as a single instance / single writer — a nonce replayed against a
+    /// *different* process would not be caught, and concurrent enrollments could
+    /// race on the single-use bootstrap key. Horizontal scaling would require
+    /// moving the replay/bootstrap state into the shared store behind a
+    /// compare-and-set. See README "single-instance assumption".
     pub clients: Arc<dyn ClientAuthScheme>,
     pub board: Arc<dyn KanbanBoard>,
     pub security: Arc<SecurityModule>,

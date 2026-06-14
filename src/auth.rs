@@ -217,6 +217,11 @@ fn verify_client(
         nonce,
     };
 
+    // SINGLE-INSTANCE ASSUMPTION: `verify` consults a process-local nonce replay
+    // cache. A replay is only rejected if the original request hit THIS process,
+    // so the API must run as a single instance / single writer. Horizontal
+    // scaling would require moving the replay cache into the shared store behind a
+    // compare-and-set (insert-if-absent). See README "single-instance assumption".
     match state.inner.clients.verify(&presented) {
         Ok(identity) => {
             // Stamp the canonical bytes into the tamper-evident audit chain.

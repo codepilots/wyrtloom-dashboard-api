@@ -20,11 +20,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use axum::http::{HeaderValue, Method};
+use axum::http::{header, HeaderValue, Method};
 use clap::Parser;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use wyrtloom_core::client_auth::ClientAuthScheme;
@@ -208,6 +209,26 @@ async fn run(cli: Cli) -> Result<()> {
         ServiceBuilder::new()
             .layer(TraceLayer::new_for_http())
             .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+            // Defence-in-depth security response headers on EVERY response. These
+            // blunt the documented residual ("XSS could USE the non-extractable
+            // key") and clickjacking, even though this crate ships no UI of its
+            // own — any SPA/client served alongside it inherits the protection.
+            // `overriding` so these win over anything a handler might set.
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(
+                    "default-src 'self'; script-src 'self'; object-src 'none'; \
+                     base-uri 'none'; frame-ancestors 'none'",
+                ),
+            ))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            ))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::REFERRER_POLICY,
+                HeaderValue::from_static("no-referrer"),
+            ))
             .layer(cors),
     );
 

@@ -132,6 +132,29 @@ audit snapshot plus a `chain_verified` flag from `SecurityModule::verify_chain`.
   method, path) are recorded; tokens, passwords, and keys never are.
 * **Config path is fixed server-side** — `/api/config` reads/writes only the
   `--config` path and validates submitted TOML (traversal rejected by the loader).
+* **Security response headers** — every response carries
+  `Content-Security-Policy` (`default-src 'self'; script-src 'self'; object-src
+  'none'; base-uri 'none'; frame-ancestors 'none'`), `X-Content-Type-Options:
+  nosniff`, and `Referrer-Policy: no-referrer` as defence-in-depth against XSS
+  (which could otherwise *use* the non-extractable client key) and clickjacking.
+
+## Deployment: single-instance assumption
+
+This API is designed to run as a **single instance / single writer**. Two pieces
+of security-critical state are process-local rather than shared:
+
+* the **client-auth nonce replay cache** (per-process; a replayed request is only
+  rejected if the original was seen by the *same* process), and
+* the **enroll / bootstrap lock** (a per-process lock serialises enrollment so a
+  single-use bootstrap key cannot be redeemed twice concurrently).
+
+Running multiple instances behind a load balancer would split this state: a nonce
+replayed against a *different* instance would not be caught, and concurrent
+enrollments could race on the bootstrap key. **Do not horizontally scale this API
+as-is.** Horizontal scaling would require moving the replay cache and the
+bootstrap/enroll state into the shared persistence store with a **compare-and-set**
+(atomic insert-if-absent) operation so the check-and-record is atomic across
+writers. This is documented, not implemented — HA is out of scope for v0.1.
 
 ## License
 
