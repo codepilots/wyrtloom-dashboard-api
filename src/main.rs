@@ -71,10 +71,11 @@ struct Cli {
     #[arg(long, default_value = "session.key")]
     session_key_file: String,
 
-    /// Tamper-evident audit JSONL file. REQUIRED — the server fails closed if
-    /// this is not provided.
+    /// Tamper-evident audit JSONL file. REQUIRED to serve — the server fails
+    /// closed if this is not provided. Not needed for one-shot provisioning
+    /// subcommands, which write no audit entries.
     #[arg(long)]
-    audit_file: String,
+    audit_file: Option<String>,
 
     /// Exact allowed CORS origin (repeatable). Empty => no cross-origin access.
     #[arg(long = "cors-origin")]
@@ -119,22 +120,56 @@ async fn run(cli: Cli) -> Result<()> {
     // ── Session/audit key: load or generate-and-persist with 0600. ─────────
     let key = load_or_create_key(&cli.session_key_file)?;
 
-    // ── Security module: keyed + mandatory audit file (fail closed). ───────
     let policy: SecurityPolicy = wyrtloom_config::load(&cli.config)
         .map(|c| c.security_policy())
         .unwrap_or_else(|_| SecurityPolicy::deny_all());
-    let security = SecurityModule::with_key(key, policy)
-        .with_audit_file(&cli.audit_file)
-        .map_err(|e| anyhow::anyhow!("audit file is mandatory and could not be opened: {e}"))?;
-    security
-        .self_check()
-        .map_err(|e| anyhow::anyhow!("security self-check failed: {e}"))?;
 
     // ── Persistence + plugins. ─────────────────────────────────────────────
     let store: Arc<dyn PersistenceProvider> =
         Arc::new(SqliteStore::open(&cli.store).context("opening persistence store")?);
     let users: Arc<dyn UserDirectory> =
         Arc::new(UserStore::new(store.clone()).context("initialising user directory")?);
+
+    // ── One-shot provisioning subcommands (perform, then exit). ────────────
+    //
+    // Provisioning is a SECOND, short-lived process that writes only to the
+    // persistence store (`store.db`); it emits no audit entries. It therefore
+    // deliberately builds the `SecurityModule` WITHOUT an audit file: attaching
+    // the audit file here would open a second appender on the same JSONL (and
+    // re-read/re-anchor the whole chain) while a server might be running,
+    // risking an audit-chain fork. Run provisioning only while the server is
+    // STOPPED — the bootstrap single-use guarantee and the audit chain assume a
+    // single writer to `store.db` / the audit file.
+    if cli.issue_bootstrap_key || cli.create_admin.is_some() {
+        // Keyed but audit-file-less: self_check still validates key entropy and
+        // structure, but no second appender is opened on the audit JSONL.
+        let security = SecurityModule::with_key(key, policy);
+        security
+            .self_check()
+            .map_err(|e| anyhow::anyhow!("security self-check failed: {e}"))?;
+        return run_provisioning(&cli, store, users).await;
+    }
+
+    // ── Server path only: keyed + mandatory audit file (fail closed). ──────
+    let audit_file = cli
+        .audit_file
+        .as_deref()
+        .context("--audit-file is required to serve (the audit log is mandatory and fails closed)")?;
+    let security = SecurityModule::with_key(key, policy)
+        .with_audit_file(audit_file)
+        .map_err(|e| anyhow::anyhow!("audit file is mandatory and could not be opened: {e}"))?;
+    security
+        .self_check()
+        .map_err(|e| anyhow::anyhow!("security self-check failed: {e}"))?;
+    // Defence-in-depth: `with_audit_file` already verifies the chain on load and
+    // fails closed, but verify again explicitly at startup so a tampered/forked
+    // audit file aborts the server rather than silently continuing.
+    security
+        .verify_chain()
+        .map_err(|e| anyhow::anyhow!("audit chain verification failed at startup, refusing to serve: {e}"))?;
+    let audit_len = security.audit_log_snapshot().len();
+    eprintln!("audit chain verified, {audit_len} entries");
+
     let clients: Arc<dyn ClientAuthScheme> =
         Arc::new(TofuClientAuth::new(store.clone()).context("initialising client auth")?);
     let board: Arc<dyn KanbanBoard> =
@@ -147,37 +182,6 @@ async fn run(cli: Cli) -> Result<()> {
         )),
         None => None,
     };
-
-    // ── One-shot provisioning subcommands (perform, then exit). ────────────
-    if cli.issue_bootstrap_key {
-        // issue_bootstrap_key is a concrete TofuClientAuth capability, not part of
-        // the ClientAuthScheme contract; the composition root may name the type.
-        let scheme = TofuClientAuth::new(store.clone()).context("client auth")?;
-        let key = scheme
-            .issue_bootstrap_key()
-            .map_err(|e| anyhow::anyhow!("issuing bootstrap key: {e}"))?;
-        println!("{key}");
-        eprintln!("[provision] single-use bootstrap key issued — give it to one client for /api/enroll");
-        return Ok(());
-    }
-    if let Some(username) = &cli.create_admin {
-        let password = std::env::var("WYRTLOOM_ADMIN_PASSWORD")
-            .context("set WYRTLOOM_ADMIN_PASSWORD to the new admin's password")?;
-        // Roles are explicit with NO hierarchy (Admin does not imply Viewer), so a
-        // bootstrap admin is granted all three roles to be fully operational.
-        match users.create(NewUser {
-            username: username.clone(),
-            password,
-            roles: vec![Role::Viewer, Role::Operator, Role::Admin],
-        }) {
-            Ok(_) => eprintln!("[provision] admin user '{username}' created"),
-            Err(AuthError::AlreadyExists) => {
-                eprintln!("[provision] admin user '{username}' already exists")
-            }
-            Err(e) => return Err(anyhow::anyhow!("creating admin: {e}")),
-        }
-        return Ok(());
-    }
 
     let app_state = AppState {
         inner: Arc::new(Inner {
@@ -242,6 +246,47 @@ async fn run(cli: Cli) -> Result<()> {
     )
     .await
     .context("server error")?;
+    Ok(())
+}
+
+/// Execute a one-shot provisioning subcommand (`--issue-bootstrap-key` or
+/// `--create-admin`) against the persistence store, then return so the process
+/// exits. Provisioning writes no audit entries and must run only while the
+/// server is stopped (single-writer assumption — see `run`).
+async fn run_provisioning(
+    cli: &Cli,
+    store: Arc<dyn PersistenceProvider>,
+    users: Arc<dyn UserDirectory>,
+) -> Result<()> {
+    if cli.issue_bootstrap_key {
+        // issue_bootstrap_key is a concrete TofuClientAuth capability, not part of
+        // the ClientAuthScheme contract; the composition root may name the type.
+        let scheme = TofuClientAuth::new(store.clone()).context("client auth")?;
+        let key = scheme
+            .issue_bootstrap_key()
+            .map_err(|e| anyhow::anyhow!("issuing bootstrap key: {e}"))?;
+        println!("{key}");
+        eprintln!("[provision] single-use bootstrap key issued — give it to one client for /api/enroll");
+        return Ok(());
+    }
+    if let Some(username) = &cli.create_admin {
+        let password = std::env::var("WYRTLOOM_ADMIN_PASSWORD")
+            .context("set WYRTLOOM_ADMIN_PASSWORD to the new admin's password")?;
+        // Roles are explicit with NO hierarchy (Admin does not imply Viewer), so a
+        // bootstrap admin is granted all three roles to be fully operational.
+        match users.create(NewUser {
+            username: username.clone(),
+            password,
+            roles: vec![Role::Viewer, Role::Operator, Role::Admin],
+        }) {
+            Ok(_) => eprintln!("[provision] admin user '{username}' created"),
+            Err(AuthError::AlreadyExists) => {
+                eprintln!("[provision] admin user '{username}' already exists")
+            }
+            Err(e) => return Err(anyhow::anyhow!("creating admin: {e}")),
+        }
+        return Ok(());
+    }
     Ok(())
 }
 

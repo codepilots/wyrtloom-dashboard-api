@@ -54,3 +54,16 @@ First implementation of the secure, frontend-agnostic dashboard API.
   through to `logout`, which invalidates the exact stamp instead of
   re-serialising (avoiding a stamp-drift / empty-payload fallback bug).
 - Shared a single hex decoder across the session and client-auth paths.
+
+### Second-pass security-audit fixes
+- **Provisioning decoupled from the audit file**: the `--issue-bootstrap-key` /
+  `--create-admin` subcommands now build the `SecurityModule` *without*
+  `with_audit_file`, so they never open a second appender on the audit JSONL or
+  re-anchor the chain. Previously they did, risking an audit-chain fork/corruption
+  when run against a live server. `--audit-file` is now optional (server-only).
+- **Audit chain verified at startup (fail closed)**: the server path explicitly
+  calls `verify_chain()` after attaching the audit file and aborts startup with a
+  clear error on failure, logging `audit chain verified, N entries` on success.
+- **Documented single-writer provisioning**: README + a code comment note that
+  provisioning is a second process sharing `store.db` and must run only while the
+  server is stopped.

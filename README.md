@@ -43,6 +43,28 @@ cargo run -- \
   cross-origin access is denied; credentials are only enabled alongside an
   explicit origin list (never `Any` / request-mirroring).
 
+## Provisioning (run only while the server is stopped)
+
+Two one-shot subcommands provision initial state. Each performs its action and
+exits immediately — it does **not** start the server:
+
+```sh
+# Issue a single-use bootstrap enrollment key (printed to stdout):
+cargo run -- --store store.db --issue-bootstrap-key
+
+# Create a fully-privileged admin (password from $WYRTLOOM_ADMIN_PASSWORD):
+WYRTLOOM_ADMIN_PASSWORD=… cargo run -- --store store.db --create-admin alice
+```
+
+**Run provisioning only while the server is stopped.** Provisioning is a
+*second process* that opens the same `store.db` as a running server. The
+bootstrap single-use guarantee (a per-process enroll lock) and the audit
+hash-chain both assume a **single writer**; a concurrent provisioning process
+would split that state. Provisioning therefore writes no audit entries and
+deliberately builds its `SecurityModule` **without** the audit file, so it never
+opens a second appender on the audit JSONL (which would risk forking the
+tamper-evident chain). Only the long-running server path attaches `--audit-file`.
+
 ## Authentication header scheme
 
 Two independent layers gate requests:
