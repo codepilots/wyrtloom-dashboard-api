@@ -134,7 +134,13 @@ async fn enforce_inner(
     }
 
     let method = request.method().to_string();
-    let path = request.uri().path().to_string();
+    // Sign over path AND query so query parameters are integrity-protected, not
+    // just the path. The client signs the identical path+query string it sends.
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
 
     // Split into parts + body so we can buffer/measure the body under the limit
     // and rebuild the request for downstream handlers.

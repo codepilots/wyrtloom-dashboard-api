@@ -32,7 +32,7 @@ use wyrtloom_core::kanban::KanbanBoard;
 use wyrtloom_core::logger::CallLogger;
 use wyrtloom_core::persistence::PersistenceProvider;
 use wyrtloom_core::security::{SecurityModule, SecurityPolicy};
-use wyrtloom_core::users::UserDirectory;
+use wyrtloom_core::users::{AuthError, NewUser, Role, UserDirectory};
 
 use plugin_kanban_sqlite::SqliteKanbanBoard;
 use plugin_logger_sqlite::SqliteCallLogger;
@@ -82,6 +82,16 @@ struct Cli {
     /// Allow binding a non-loopback address over plain HTTP. DANGEROUS.
     #[arg(long)]
     insecure_allow_remote_http: bool,
+
+    /// Provisioning: issue a single-use bootstrap enrollment key, print it to
+    /// stdout, and exit (give it to one client for POST /api/enroll).
+    #[arg(long)]
+    issue_bootstrap_key: bool,
+
+    /// Provisioning: create an Admin user with this username (password read from
+    /// $WYRTLOOM_ADMIN_PASSWORD), then exit.
+    #[arg(long)]
+    create_admin: Option<String>,
 }
 
 #[tokio::main]
@@ -136,6 +146,37 @@ async fn run(cli: Cli) -> Result<()> {
         )),
         None => None,
     };
+
+    // ── One-shot provisioning subcommands (perform, then exit). ────────────
+    if cli.issue_bootstrap_key {
+        // issue_bootstrap_key is a concrete TofuClientAuth capability, not part of
+        // the ClientAuthScheme contract; the composition root may name the type.
+        let scheme = TofuClientAuth::new(store.clone()).context("client auth")?;
+        let key = scheme
+            .issue_bootstrap_key()
+            .map_err(|e| anyhow::anyhow!("issuing bootstrap key: {e}"))?;
+        println!("{key}");
+        eprintln!("[provision] single-use bootstrap key issued — give it to one client for /api/enroll");
+        return Ok(());
+    }
+    if let Some(username) = &cli.create_admin {
+        let password = std::env::var("WYRTLOOM_ADMIN_PASSWORD")
+            .context("set WYRTLOOM_ADMIN_PASSWORD to the new admin's password")?;
+        // Roles are explicit with NO hierarchy (Admin does not imply Viewer), so a
+        // bootstrap admin is granted all three roles to be fully operational.
+        match users.create(NewUser {
+            username: username.clone(),
+            password,
+            roles: vec![Role::Viewer, Role::Operator, Role::Admin],
+        }) {
+            Ok(_) => eprintln!("[provision] admin user '{username}' created"),
+            Err(AuthError::AlreadyExists) => {
+                eprintln!("[provision] admin user '{username}' already exists")
+            }
+            Err(e) => return Err(anyhow::anyhow!("creating admin: {e}")),
+        }
+        return Ok(());
+    }
 
     let app_state = AppState {
         inner: Arc::new(Inner {
