@@ -399,12 +399,24 @@ async fn get_config(State(state): State<AppState>) -> Response {
 
 async fn put_config(State(state): State<AppState>, body: String) -> Response {
     // Parse + validate the submitted TOML, then save to the fixed server path.
+    // Internal parser/validator detail is logged server-side (audit log) but
+    // never echoed to the client — the response stays generic.
     let cfg = match wyrtloom_config::from_str(&body) {
         Ok(c) => c,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid config: {e}")),
+        Err(e) => {
+            state
+                .inner
+                .security
+                .record_decision(false, format!("config parse rejected: {e}"));
+            return err(StatusCode::BAD_REQUEST, "invalid configuration");
+        }
     };
     if let Err(e) = wyrtloom_config::validate(&cfg) {
-        return err(StatusCode::BAD_REQUEST, &format!("config validation failed: {e}"));
+        state
+            .inner
+            .security
+            .record_decision(false, format!("config validation rejected: {e}"));
+        return err(StatusCode::BAD_REQUEST, "invalid configuration");
     }
     match wyrtloom_config::save(&state.inner.config_path, &cfg) {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),

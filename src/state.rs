@@ -21,8 +21,7 @@ use wyrtloom_core::persistence::{
 use wyrtloom_core::security::SecurityModule;
 use wyrtloom_core::users::UserDirectory;
 use wyrtloom_core::client_auth::ClientAuthScheme;
-
-use plugin_logger_sqlite::SqliteCallLogger;
+use wyrtloom_core::logger::CallLogger;
 
 /// Collection holding revoked session nonces (durable across restarts).
 pub const REVOKED_SESSIONS: &str = "revoked_sessions";
@@ -58,7 +57,7 @@ pub struct Inner {
     pub clients: Arc<dyn ClientAuthScheme>,
     pub board: Arc<dyn KanbanBoard>,
     pub security: Arc<SecurityModule>,
-    pub logger: Option<Arc<SqliteCallLogger>>,
+    pub logger: Option<Arc<dyn CallLogger>>,
     /// Caps concurrent argon2 verifications so a burst of `/login` requests
     /// cannot exhaust CPU/memory (argon2 is deliberately expensive).
     pub auth_semaphore: Arc<Semaphore>,

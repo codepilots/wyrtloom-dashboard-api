@@ -29,6 +29,7 @@ use tower_http::trace::TraceLayer;
 
 use wyrtloom_core::client_auth::ClientAuthScheme;
 use wyrtloom_core::kanban::KanbanBoard;
+use wyrtloom_core::logger::CallLogger;
 use wyrtloom_core::persistence::PersistenceProvider;
 use wyrtloom_core::security::{SecurityModule, SecurityPolicy};
 use wyrtloom_core::users::UserDirectory;
@@ -127,7 +128,9 @@ async fn run(cli: Cli) -> Result<()> {
         Arc::new(TofuClientAuth::new(store.clone()).context("initialising client auth")?);
     let board: Arc<dyn KanbanBoard> =
         Arc::new(SqliteKanbanBoard::open(&cli.kanban_db).context("opening kanban board")?);
-    let logger = match &cli.logger_db {
+    // The composition root is the only place that names the concrete logger
+    // plugin; the rest of the app holds it behind the `CallLogger` trait.
+    let logger: Option<Arc<dyn CallLogger>> = match &cli.logger_db {
         Some(p) => Some(Arc::new(
             SqliteCallLogger::open(p).context("opening logger db")?,
         )),
