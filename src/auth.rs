@@ -29,7 +29,9 @@ use sha2::{Digest, Sha256};
 use wyrtloom_core::client_auth::PresentedClientAuth;
 use wyrtloom_core::users::{Role, User};
 
-use wyrtloom_clientauth_tofu::canonicalize;
+// Build the signed request bytes from the core contract, not a concrete scheme
+// plugin — the canonical encoding is shared agreement, so it lives in core.
+use wyrtloom_core::client_auth::canonical_request as canonicalize;
 
 use crate::session::{self, SessionPayload};
 use crate::state::{now_unix_checked, AppState, RevocationStatus, MAX_BODY_BYTES};

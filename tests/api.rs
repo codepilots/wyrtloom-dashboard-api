@@ -14,8 +14,8 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
-use wyrtloom_clientauth_tofu::{canonicalize, TofuClientAuth};
-use wyrtloom_core::client_auth::{ClientAuthScheme, EnrollmentRequest};
+use wyrtloom_clientauth_tofu::TofuClientAuth;
+use wyrtloom_core::client_auth::{canonical_request as canonicalize, ClientAuthScheme, EnrollmentRequest};
 use wyrtloom_core::kanban::KanbanBoard;
 use wyrtloom_core::persistence::PersistenceProvider;
 use wyrtloom_core::security::{SecurityModule, SecurityPolicy};
