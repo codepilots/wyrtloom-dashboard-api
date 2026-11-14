@@ -126,7 +126,8 @@ Failure → `401` (auth) / `403` (RBAC).
 | GET    | `/api/audit`                  | Role: Admin          |
 
 `POST /api/login` returns `{ "token", "exp_unix" }`. `GET /api/audit` returns the
-audit snapshot plus a `chain_verified` flag from `SecurityModule::verify_chain`.
+audit snapshot plus a `chain_verified` flag from `SecurityModule::verify_chain`
+and an `anchor_verified` flag from `SecurityModule::verify_anchor`.
 
 ## Security posture
 
@@ -150,6 +151,9 @@ audit snapshot plus a `chain_verified` flag from `SecurityModule::verify_chain`.
 * **Exact-origin CORS** — `AllowOrigin::list` only; never `Any` or mirror;
   credentials only with the explicit list.
 * **Mandatory audit file** — fail closed if `--audit-file` is missing.
+* **Audit anchor** — a signed entry count + chain head is kept in `--store`; an
+  audit file with its newest entries dropped is refused at startup. An audit file
+  that predates anchoring needs one start with `--audit-anchor-enroll`.
 * **No secrets in audit detail** — only public identifiers (client id, user id,
   method, path) are recorded; tokens, passwords, and keys never are.
 * **Config path is fixed server-side** — `/api/config` reads/writes only the

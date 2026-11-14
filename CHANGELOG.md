@@ -2,6 +2,24 @@
 
 All notable changes to `wyrtloom-dashboard-api` are documented here.
 
+## [Unreleased]
+
+### Security
+- **Audit-chain anchoring.** The server keeps a signed high-water mark of the
+  audit chain (entry count + chain head) in the persistence store and refuses to
+  start if the audit file is shorter than it — detecting suffix truncation, which
+  the chain alone cannot. Uses `SecurityModule::with_audit_anchor` with
+  `PersistenceAuditAnchor` from `wyrtloom-core` (requires the core release that
+  adds them).
+- `GET /api/audit` gains `anchor_verified` (additive).
+- New `--audit-anchor-enroll` flag for one-time adoption on an existing audit file.
+
+### Upgrade note
+- An existing deployment with a non-empty audit file will **refuse to start**
+  until it is started once with `--audit-anchor-enroll`.
+- Deleting or rotating the audit file now stops the server starting; see
+  `docs/deployment.md`.
+
 ## [0.1.0] — initial release
 
 First implementation of the secure, frontend-agnostic dashboard API.

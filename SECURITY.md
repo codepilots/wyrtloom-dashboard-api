@@ -42,9 +42,10 @@ replayed, or outlive a role change.
   process can connect, which is exactly why auth is mandatory on every endpoint.
 - Horizontal scale / HA — single-instance / single-writer is assumed.
 - Compromise of the one key file (root of trust for both signing and audit).
-- Audit-log *truncation* (an attacker who can rewrite the whole file from the
-  start can produce a self-consistent shorter chain) — inherited from core,
-  roadmapped to external anchoring.
+- Audit-log truncation by an attacker who can write **both** the audit file and
+  the persistence store. Truncating the audit file alone is detected (see the
+  audit anchor below); rolling the store's anchor record back to an older
+  genuine one alongside a matching truncated log is not.
 
 ---
 
@@ -161,6 +162,15 @@ All in `src/main.rs` unless noted.
   the signed body (`src/auth.rs:148`, `src/state.rs:43`).
 - **Mandatory 0600 audit file, fail-closed** (`src/main.rs:126-131`). The server
   refuses to start if `--audit-file` cannot be opened. A `self_check` runs after.
+- **Audit anchor in the persistence store, fail-closed.** A signed high-water
+  mark (entry count + chain head) is kept in `store.db` under the
+  `audit_anchor` collection and advanced after every audit entry
+  (`SecurityModule::with_audit_anchor` over `PersistenceAuditAnchor`). At startup
+  an audit file **shorter than its anchor** — i.e. with its newest entries
+  dropped — is refused, as is a forged anchor or an unreadable store. A
+  non-empty audit file with **no** anchor is also refused unless
+  `--audit-anchor-enroll` is passed (one-time adoption). `GET /api/audit`
+  reports the live check as `anchor_verified`.
 - **Session key file generated 0600 with `O_EXCL`** (`load_or_create_key`,
   `src/main.rs:288-325`): `create_new(true)` (O_EXCL), `mode(0o600)`, then a
   defensive `set_permissions(0o600)` against a permissive umask. An all-zero or
@@ -247,9 +257,19 @@ Two one-shot subcommands perform their action and exit (`src/main.rs:151-180`):
   its signatures so they match the scheme's expected encoding. (The CSP / nosniff
   / referrer-policy headers blunt the residual that XSS could *use* the
   non-extractable key even though it cannot exfiltrate it.)
-- **Audit-truncation limitation inherited from core.** The chain detects in-place
-  tampering, but an attacker able to rewrite the entire file from the start can
-  produce a shorter, self-consistent chain. External anchoring is roadmapped.
+- **The audit anchor shares a host with the log.** It lives in `store.db`, a
+  different file from the audit JSONL, so it catches truncation by anyone who can
+  reach the audit file but not the store. An attacker who can write both can
+  restore an older genuine anchor record next to a matching truncated log, and
+  deleting both files looks like a fresh install. An off-host anchor store would
+  close that; none exists yet.
+- **`--audit-anchor-enroll` must not be left on.** With it, a deleted anchor is
+  silently re-created from whatever the log now holds. Use it for the one start
+  that adopts anchoring on an existing audit file, then remove it.
+- **Deleting or rotating the audit file now stops the server starting**, by
+  design: the store still records the old length. There is no rotation command;
+  retiring a log means deliberately removing the `dashboard-api` record from the
+  `audit_anchor` collection as well.
 
 ---
 
