@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put, MethodRouter};
 use axum::{Extension, Json, Router};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,6 +24,7 @@ use wyrtloom_core::users::Role;
 use crate::auth::{enforce, AuthContext, RequiredAuth};
 use crate::session::{self, SessionPayload};
 use crate::state::{now_unix, AppState, SESSION_TTL_SECS};
+use crate::state;
 
 /// One row of the route table: method, path, required auth, and the bare
 /// handler wrapped as a `MethodRouter`.
@@ -89,6 +91,12 @@ pub fn route_table() -> Vec<RouteSpec> {
             path: "/api/tasks/:id/block",
             auth: RequiredAuth::Role(Role::Operator),
             handler: post(block_task),
+        },
+        RouteSpec {
+            method: "POST",
+            path: "/api/tasks/:id/execute",
+            auth: RequiredAuth::Role(Role::Operator),
+            handler: post(execute_task),
         },
         RouteSpec {
             method: "GET",
@@ -203,6 +211,14 @@ pub struct TransitionBody {
 #[derive(Deserialize)]
 pub struct BlockBody {
     pub reason: String,
+}
+
+/// Optional override for the user prompt when executing a task. When omitted,
+/// the task's own title is used as the prompt.
+#[derive(Deserialize)]
+pub struct ExecuteTaskBody {
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -383,6 +399,98 @@ async fn block_task(
     match state.inner.board.block(id, actor, reason) {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(_) => err(StatusCode::BAD_REQUEST, "block rejected"),
+    }
+}
+
+/// Execute an existing task with the configured LLM provider (Path B wiring:
+/// the dashboard becomes the front door for task execution, not just CRUD).
+///
+/// The task must already exist on the shared board; execution claims it, runs
+/// it through `Pipeline::execute` (parse → plan → execute → verify) against the
+/// configured provider, and transitions it to Done / Blocked / Stopped.
+///
+/// The provider call and kanban writes are synchronous and potentially slow, so
+/// the whole run is offloaded onto the blocking pool (`spawn_blocking`); a
+/// semaphore caps how many run concurrently.
+async fn execute_task(
+    State(state): State<AppState>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<ExecuteTaskBody>,
+) -> Response {
+    // Execution requires a configured provider — fail closed, no fallback.
+    let provider = match &state.inner.provider {
+        Some(p) => p.clone(),
+        None => return err(StatusCode::SERVICE_UNAVAILABLE, "no LLM provider configured"),
+    };
+    // Look up the task so we know its title (used as the default prompt) and
+    // confirm it exists before claiming anything.
+    let title = match state.inner.board.get(id) {
+        Ok(task) => task.title,
+        Err(_) => return err(StatusCode::NOT_FOUND, "task not found"),
+    };
+    let prompt = body.prompt.unwrap_or_else(|| title.clone());
+
+    // The pipeline needs a call logger; run executions only when one is
+    // configured (the audit-less CRUD paths still work without it).
+    let logger = match &state.inner.logger {
+        Some(l) => l.clone(),
+        None => return err(StatusCode::SERVICE_UNAVAILABLE, "no call logger configured"),
+    };
+
+    let permit = match state.inner.exec_semaphore.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "execution capacity exhausted"),
+    };
+
+    // Clone the pieces the blocking closure needs; move `title`+`prompt` in so
+    // the closure is 'static.
+    let board = state.inner.board.clone();
+    let escalation = Arc::new(state::HeadlessEscalation);
+    let profile = state.inner.profile.clone();
+    let agent_id: String = "agent:wyrtloom-api".into();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let pipeline = wyrtloom_core::pipeline::Pipeline {
+            kanban: board,
+            provider,
+            logger,
+            escalation,
+            profile,
+            agent_id,
+        };
+        pipeline.execute(id, &title, &prompt)
+    })
+    .await;
+
+    match result {
+        Ok(outcome) => json_outcome(id, outcome),
+        Err(e) => {
+            eprintln!("[execute] task {id} execution task panicked: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "execution failed")
+        }
+    }
+}
+
+/// Render a `PipelineOutcome` as the execution response.
+fn json_outcome(_id: uuid::Uuid, outcome: wyrtloom_core::pipeline::PipelineOutcome) -> Response {
+    use wyrtloom_core::pipeline::PipelineOutcome as Out;
+    match outcome {
+        Out::Done { task_id, result } => (
+            StatusCode::OK,
+            Json(json!({ "task_id": task_id, "status": "done", "result": result })),
+        )
+            .into_response(),
+        Out::Blocked { task_id, reason } => (
+            StatusCode::OK,
+            Json(json!({ "task_id": task_id, "status": "blocked", "reason": reason })),
+        )
+            .into_response(),
+        Out::Stopped { task_id } => (
+            StatusCode::OK,
+            Json(json!({ "task_id": task_id, "status": "stopped" })),
+        )
+            .into_response(),
     }
 }
 

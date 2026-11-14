@@ -32,12 +32,15 @@ use wyrtloom_core::client_auth::ClientAuthScheme;
 use wyrtloom_core::kanban::KanbanBoard;
 use wyrtloom_core::logger::CallLogger;
 use wyrtloom_core::persistence::PersistenceProvider;
+use wyrtloom_core::profile::TaskProfile;
+use wyrtloom_core::provider::LlmProvider;
 use wyrtloom_core::audit_anchor::PersistenceAuditAnchor;
 use wyrtloom_core::security::{AnchorEnrollment, SecurityModule, SecurityPolicy};
 use wyrtloom_core::users::{AuthError, NewUser, Role, UserDirectory};
 
 use plugin_kanban_sqlite::SqliteKanbanBoard;
 use plugin_logger_sqlite::SqliteCallLogger;
+use plugin_provider_ollama::OllamaProvider;
 use tokio::sync::Semaphore;
 use wyrtloom_clientauth_tofu::TofuClientAuth;
 use wyrtloom_store_sqlite::SqliteStore;
@@ -136,6 +139,34 @@ async fn run(cli: Cli) -> Result<()> {
         .map(|c| c.security_policy())
         .unwrap_or_else(|_| SecurityPolicy::deny_all());
 
+    // ── Provider + task profile for the /execute route, from [provider]. ───
+    // Built from the same wyrtloom.toml [provider] table the serial circuit
+    // uses: base_url (validated at construction, SSRF-guarded) and model. A
+    // missing/unusable provider disables execution (503) rather than falling
+    // back silently.
+    let (provider, profile): (Option<Arc<dyn LlmProvider>>, Option<TaskProfile>) =
+        match wyrtloom_config::load(&cli.config) {
+            Ok(cfg) if !cfg.provider.base_url.trim().is_empty() => {
+                let base_url = cfg.provider.base_url.clone();
+                let model = cfg.provider.model.clone();
+                match OllamaProvider::new(base_url) {
+                    Ok(provider) => {
+                        let mut profile = TaskProfile::default_v01();
+                        profile.model = model.clone();
+                        profile.provider = cfg.provider.name.clone();
+                        (
+                            Some(Arc::new(provider) as Arc<dyn LlmProvider>),
+                            Some(profile),
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!("[boot] provider not usable, execution disabled: {e}");
+                        (None, None)
+                    }
+                }
+            }
+            _ => (None, None),
+        };
     // ── Persistence + plugins. ─────────────────────────────────────────────
     let store: Arc<dyn PersistenceProvider> =
         Arc::new(SqliteStore::open(&cli.store).context("opening persistence store")?);
@@ -221,6 +252,14 @@ async fn run(cli: Cli) -> Result<()> {
             users,
             clients,
             board,
+            provider,
+            profile: match &profile {
+                Some(p) => p.clone(),
+                // Unreachable in practice: `provider` and `profile` are always
+                // Some together. Defensive default so the field is never unset.
+                None => TaskProfile::default_v01(),
+            },
+            exec_semaphore: Arc::new(Semaphore::new(2)),
             security: Arc::new(security),
             logger,
             // Cap concurrent argon2 verifications to the CPU count (min 1).

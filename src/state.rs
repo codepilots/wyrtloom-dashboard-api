@@ -18,10 +18,13 @@ use wyrtloom_core::kanban::KanbanBoard;
 use wyrtloom_core::persistence::{
     CollectionSpec, PersistenceProvider, Query, Record, StoreError,
 };
+use wyrtloom_core::provider::LlmProvider;
+use wyrtloom_core::profile::TaskProfile;
 use wyrtloom_core::security::SecurityModule;
 use wyrtloom_core::users::UserDirectory;
 use wyrtloom_core::client_auth::ClientAuthScheme;
 use wyrtloom_core::logger::CallLogger;
+use wyrtloom_core::escalation::{Escalation, EscalationError, HumanEscalation, HumanResponse};
 
 /// Collection holding revoked session nonces (durable across restarts).
 pub const REVOKED_SESSIONS: &str = "revoked_sessions";
@@ -63,6 +66,17 @@ pub struct Inner {
     /// compare-and-set. See README "single-instance assumption".
     pub clients: Arc<dyn ClientAuthScheme>,
     pub board: Arc<dyn KanbanBoard>,
+    /// The configured LLM provider built from `[provider]` in wyrtloom.toml.
+    /// `None` when no provider is usable — the `/api/tasks/:id/execute` route
+    /// then returns 503 (execution unavailable) rather than running unverified.
+    pub provider: Option<Arc<dyn LlmProvider>>,
+    /// The task profile (model, output budget, escalation threshold) selected
+    /// for execution. Built from `[provider]` alongside `provider`.
+    pub profile: TaskProfile,
+    /// Caps concurrent task executions. Execution is CPU/IO bound
+    /// (provider call + kanban writes); a semaphore keeps a burst of execute
+    /// requests from denting the async reactor and the single-writer store.
+    pub exec_semaphore: Arc<Semaphore>,
     pub security: Arc<SecurityModule>,
     pub logger: Option<Arc<dyn CallLogger>>,
     /// Caps concurrent argon2 verifications so a burst of `/login` requests
@@ -159,6 +173,24 @@ pub fn now_unix_checked() -> Option<i64> {
 /// must use [`now_unix_checked`] instead so they can fail closed.
 pub fn now_unix() -> i64 {
     now_unix_checked().unwrap_or(0)
+}
+
+/// Headless escalation used when the API executes a task and the agent blocks.
+///
+/// The API has no interactive terminal to ask *which* way to proceed, so when
+/// the agent reports blocked, the task is recorded as **Blocked with the agent's
+/// reason** (the `record_blocked` path) rather than prompting a human. This
+/// keeps execution deterministic and non-blocking for the operator. A future
+/// UI can map this to a real interactive escalation.
+pub struct HeadlessEscalation;
+
+impl HumanEscalation for HeadlessEscalation {
+    fn escalate(&self, _e: Escalation) -> Result<HumanResponse, EscalationError> {
+        // Any non-"skip" choice routes the pipeline into `record_blocked`,
+        // leaving the task Blocked with the agent's reason. We choose a
+        // deliberately meaningless id so no one mistakes it for a real action.
+        Ok(HumanResponse::Chose("headless-block".into()))
+    }
 }
 
 // ---------------------------------------------------------------------------

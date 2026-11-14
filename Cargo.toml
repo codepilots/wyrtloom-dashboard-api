@@ -10,6 +10,7 @@ wyrtloom-core         = { path = "../wyrtloom/crates/core" }
 # wyrtloom-core       = { git = "https://github.com/codepilots/wyrtloom", package = "wyrtloom-core" }
 plugin-kanban-sqlite  = { path = "../wyrtloom/crates/plugin-kanban-sqlite" }
 plugin-logger-sqlite  = { path = "../wyrtloom/crates/plugin-logger-sqlite" }
+plugin-provider-ollama = { path = "../wyrtloom/crates/plugin-provider-ollama" }
 wyrtloom-store-sqlite = { path = "../wyrtloom-store-sqlite" }
 wyrtloom-users        = { path = "../wyrtloom-users" }
 wyrtloom-clientauth-tofu = { path = "../wyrtloom-clientauth-tofu" }
