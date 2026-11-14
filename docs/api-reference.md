@@ -317,8 +317,13 @@ verification flag.
 - **Auth:** `Role(Admin)`.
 - **Success — `200 OK`:**
   ```json
-  { "chain_verified": true, "entries": [ <audit entry>, ... ] }
+  { "chain_verified": true, "anchor_verified": true, "entries": [ <audit entry>, ... ] }
   ```
+  `anchor_verified` is the result of `SecurityModule::verify_anchor()` at request
+  time: the store's signed high-water mark is present, genuine, and exactly in
+  step with the chain. `false` means the anchor record was lost or altered, the
+  store could not be read, or an anchor update failed and the newest entries are
+  not yet protected against truncation.
   `chain_verified` is the result of `SecurityModule::verify_chain()` at request
   time (detects in-place tampering, reordering, mid-chain deletion). `entries`
   carry only public identifiers — never tokens, passwords, or keys.

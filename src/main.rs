@@ -32,7 +32,8 @@ use wyrtloom_core::client_auth::ClientAuthScheme;
 use wyrtloom_core::kanban::KanbanBoard;
 use wyrtloom_core::logger::CallLogger;
 use wyrtloom_core::persistence::PersistenceProvider;
-use wyrtloom_core::security::{SecurityModule, SecurityPolicy};
+use wyrtloom_core::audit_anchor::PersistenceAuditAnchor;
+use wyrtloom_core::security::{AnchorEnrollment, SecurityModule, SecurityPolicy};
 use wyrtloom_core::users::{AuthError, NewUser, Role, UserDirectory};
 
 use plugin_kanban_sqlite::SqliteKanbanBoard;
@@ -77,6 +78,14 @@ struct Cli {
     #[arg(long)]
     audit_file: Option<String>,
 
+    /// One-time adoption of audit anchoring: accept an EXISTING, non-empty audit
+    /// file that has no anchor in the store yet, and anchor it as it stands.
+    /// Without this flag such a start is refused, because a missing anchor is
+    /// what an attacker who deleted it would present. Pass it for one start
+    /// only, then remove it.
+    #[arg(long)]
+    audit_anchor_enroll: bool,
+
     /// Exact allowed CORS origin (repeatable). Empty => no cross-origin access.
     #[arg(long = "cors-origin")]
     cors_origin: Vec<String>,
@@ -95,6 +104,9 @@ struct Cli {
     #[arg(long)]
     create_admin: Option<String>,
 }
+
+/// Id of this server's audit-anchor record in the persistence store.
+const AUDIT_ANCHOR_ID: &str = "dashboard-api";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -155,9 +167,26 @@ async fn run(cli: Cli) -> Result<()> {
         .audit_file
         .as_deref()
         .context("--audit-file is required to serve (the audit log is mandatory and fails closed)")?;
+    // The audit chain's high-water mark (signed entry count + chain head) is
+    // kept in the persistence store — a different file from the audit JSONL —
+    // so a log whose newest entries were dropped is refused at startup.
+    let anchor = PersistenceAuditAnchor::new(store.clone(), AUDIT_ANCHOR_ID)
+        .map_err(|e| anyhow::anyhow!("initialising audit anchor: {e}"))?;
+    let enrollment = if cli.audit_anchor_enroll {
+        AnchorEnrollment::EnrollExisting
+    } else {
+        AnchorEnrollment::Strict
+    };
     let security = SecurityModule::with_key(key, policy)
         .with_audit_file(audit_file)
-        .map_err(|e| anyhow::anyhow!("audit file is mandatory and could not be opened: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("audit file is mandatory and could not be opened: {e}"))?
+        .with_audit_anchor(Arc::new(anchor), enrollment)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "audit anchor check failed, refusing to serve: {e}. \
+                 If this audit file predates anchoring, start once with --audit-anchor-enroll."
+            )
+        })?;
     security
         .self_check()
         .map_err(|e| anyhow::anyhow!("security self-check failed: {e}"))?;
@@ -167,8 +196,11 @@ async fn run(cli: Cli) -> Result<()> {
     security
         .verify_chain()
         .map_err(|e| anyhow::anyhow!("audit chain verification failed at startup, refusing to serve: {e}"))?;
+    security
+        .verify_anchor()
+        .map_err(|e| anyhow::anyhow!("audit anchor verification failed at startup, refusing to serve: {e}"))?;
     let audit_len = security.audit_log_snapshot().len();
-    eprintln!("audit chain verified, {audit_len} entries");
+    eprintln!("audit chain and anchor verified, {audit_len} entries");
 
     let clients: Arc<dyn ClientAuthScheme> =
         Arc::new(TofuClientAuth::new(store.clone()).context("initialising client auth")?);

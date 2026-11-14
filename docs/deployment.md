@@ -101,6 +101,7 @@ cargo run -- \
 | `--config <PATH>` | `wyrtloom.toml` | The **only** config file the API reads/writes (`GET`/`PUT /api/config`). |
 | `--session-key-file <PATH>` | `session.key` | 32-byte session/audit key file. Generated `0600` if missing, reused thereafter. |
 | `--audit-file <PATH>` | (none) | Tamper-evident audit JSONL. **Required to serve** — the server fails closed if absent or unopenable. Not used by the one-shot provisioning subcommands. |
+| `--audit-anchor-enroll` | off | One-time: accept an existing, non-empty audit file that has no anchor in `--store` yet, and anchor it as it stands. Remove after that start. |
 | `--logger-db <PATH>` | (none) | Optional SQLite DB for the call logger. With none, `GET /api/logs` returns an empty list. |
 | `--cors-origin <ORIGIN>` | (none) | Exact allowed CORS origin. **Repeatable.** Empty ⇒ no cross-origin access. |
 | `--insecure-allow-remote-http` | off | Allow binding a non-loopback address over plain HTTP. **Dangerous.** |
@@ -179,9 +180,28 @@ load balancer would split this state. HA is out of scope for v0.1.
 `--audit-file` is **required** to serve; the server fails closed if it is missing
 or cannot be opened. The hash-chained, `0600` audit file is **verified at startup**
 (`verify_chain`) — a tampered or forked chain aborts the server rather than
-serving silently. Keep the audit file `0600` and on durable storage. (The chain
-detects in-place tampering; full-file truncation is a documented limitation,
-roadmapped to external anchoring.)
+serving silently. Keep the audit file `0600` and on durable storage.
+
+### Audit anchor (truncation detection)
+
+The server keeps a signed high-water mark of the audit chain — its entry count and
+chain head — in the `--store` database, and updates it after every audit entry. At
+startup it refuses to serve if the audit file is **shorter than the anchor says**
+(its newest entries were dropped), if the anchor does not verify, or if the store
+cannot be read.
+
+- **Upgrading an existing deployment:** an audit file written before anchoring has
+  no anchor, and the server will refuse to start with `audit anchor missing`. Start
+  it **once** with `--audit-anchor-enroll`, then remove the flag. Leaving it on
+  would let a deleted anchor be re-created silently.
+- **Keep `--store` and `--audit-file` together in backups.** Restoring an older
+  audit file against a newer store is reported as truncation.
+- **Deleting or rotating the audit file** stops the server starting, by design.
+  Retiring a log means also removing the `dashboard-api` record from the store's
+  `audit_anchor` collection.
+- **Limit:** the anchor is on the same host as the log. It defends against someone
+  who can alter the audit file but not the store; an attacker who can write both
+  can roll the anchor back to an older value.
 
 ### Other built-in controls (no operator action needed)
 

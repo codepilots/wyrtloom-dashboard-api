@@ -459,9 +459,16 @@ async fn logs(State(state): State<AppState>) -> Response {
 async fn audit(State(state): State<AppState>) -> Response {
     let snapshot = state.inner.security.audit_log_snapshot();
     let chain_ok = state.inner.security.verify_chain().is_ok();
+    // False when no anchor is configured, the store has lost or cannot return
+    // the record, or the anchor is out of step with the chain.
+    let anchor_ok = state.inner.security.verify_anchor().is_ok();
     (
         StatusCode::OK,
-        Json(json!({ "chain_verified": chain_ok, "entries": snapshot })),
+        Json(json!({
+            "chain_verified": chain_ok,
+            "anchor_verified": anchor_ok,
+            "entries": snapshot,
+        })),
     )
         .into_response()
 }
