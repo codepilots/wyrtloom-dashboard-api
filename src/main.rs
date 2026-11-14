@@ -114,10 +114,64 @@ const AUDIT_ANCHOR_ID: &str = "dashboard-api";
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(cli).await
+
+    // ── Provider + task profile for the /execute route, from [provider]. ───
+    // Built from the same wyrtloom.toml [provider] table the serial circuit
+    // uses: base_url (validated at construction, SSRF-guarded) and model. A
+    // missing/unusable provider disables execution (503) rather than falling
+    // back silently.
+    //
+    // `OllamaProvider::new` builds a `reqwest::blocking::Client`, which
+    // creates and drops its own tokio runtime; doing that directly on an
+    // async worker panics ("Cannot drop a runtime where blocking is not
+    // allowed"). So the construction is wrapped in `block_in_place`, which
+    // runs it on a blocking-capable thread. (Live-run find 2026-11-14: the
+    // very first config with a non-empty base_url tripped this at startup.)
+    let (provider, profile): (Option<Arc<dyn LlmProvider>>, Option<TaskProfile>) =
+        tokio::task::block_in_place(|| build_execution_provider(cli.config.as_str()));
+
+    run(cli, provider, profile).await
 }
 
-async fn run(cli: Cli) -> Result<()> {
+/// Construct the execute-route provider + profile synchronously — run on a
+/// blocking thread via `block_in_place`, never on an async worker (the
+/// `reqwest::blocking` client inside cannot be built in async context — §main).
+/// Returns `(None, None)` when the provider is absent or unusable so execution
+/// fails closed (503).
+fn build_execution_provider(cfg_path: &str)
+    -> (Option<Arc<dyn LlmProvider>>, Option<TaskProfile>) {
+    let cfg = match wyrtloom_config::load(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[boot] config '{cfg_path}' not readable, execution disabled: {e}");
+            return (None, None);
+        }
+    };
+    if cfg.provider.base_url.trim().is_empty() {
+        return (None, None);
+    }
+    let base_url = cfg.provider.base_url.clone();
+    let model = cfg.provider.model.clone();
+    match OllamaProvider::new(base_url) {
+        Ok(provider) => {
+            let mut profile = TaskProfile::default_v01();
+            profile.model = model.clone();
+            profile.provider = cfg.provider.name.clone();
+            (Some(Arc::new(provider) as Arc<dyn LlmProvider>), Some(profile))
+        }
+        Err(e) => {
+            eprintln!("[boot] provider not usable, execution disabled: {e}");
+            (None, None)
+        }
+    }
+}
+/// Full serve path. Provider + profile are built synchronously in `main`
+/// (outside the async runtime) and threaded in — see `build_execution_provider`.
+async fn run(
+    cli: Cli,
+    provider: Option<Arc<dyn LlmProvider>>,
+    profile: Option<TaskProfile>,
+) -> Result<()> {
     // ── Transport guard: refuse non-loopback bind over plain HTTP. ─────────
     let addr: SocketAddr = cli
         .bind
@@ -139,34 +193,6 @@ async fn run(cli: Cli) -> Result<()> {
         .map(|c| c.security_policy())
         .unwrap_or_else(|_| SecurityPolicy::deny_all());
 
-    // ── Provider + task profile for the /execute route, from [provider]. ───
-    // Built from the same wyrtloom.toml [provider] table the serial circuit
-    // uses: base_url (validated at construction, SSRF-guarded) and model. A
-    // missing/unusable provider disables execution (503) rather than falling
-    // back silently.
-    let (provider, profile): (Option<Arc<dyn LlmProvider>>, Option<TaskProfile>) =
-        match wyrtloom_config::load(&cli.config) {
-            Ok(cfg) if !cfg.provider.base_url.trim().is_empty() => {
-                let base_url = cfg.provider.base_url.clone();
-                let model = cfg.provider.model.clone();
-                match OllamaProvider::new(base_url) {
-                    Ok(provider) => {
-                        let mut profile = TaskProfile::default_v01();
-                        profile.model = model.clone();
-                        profile.provider = cfg.provider.name.clone();
-                        (
-                            Some(Arc::new(provider) as Arc<dyn LlmProvider>),
-                            Some(profile),
-                        )
-                    }
-                    Err(e) => {
-                        eprintln!("[boot] provider not usable, execution disabled: {e}");
-                        (None, None)
-                    }
-                }
-            }
-            _ => (None, None),
-        };
     // ── Persistence + plugins. ─────────────────────────────────────────────
     let store: Arc<dyn PersistenceProvider> =
         Arc::new(SqliteStore::open(&cli.store).context("opening persistence store")?);
@@ -235,11 +261,26 @@ async fn run(cli: Cli) -> Result<()> {
 
     let clients: Arc<dyn ClientAuthScheme> =
         Arc::new(TofuClientAuth::new(store.clone()).context("initialising client auth")?);
+    // The kanban board and call logger default to [storage] paths in
+    // wyrtloom.toml (so the API shares the board file the runtime writes),
+    // falling back to the CLI flags only when the config is absent or does not
+    // set them. This keeps the board path a single source of truth.
+    let (kanban_db, logger_db): (String, Option<String>) = {
+        let cfg = wyrtloom_config::load(&cli.config).ok();
+        (
+            cfg.as_ref()
+                .and_then(|c| c.storage.kanban_db.clone())
+                .unwrap_or_else(|| cli.kanban_db.clone()),
+            cfg.as_ref()
+                .and_then(|c| c.storage.logger_db.clone())
+                .or_else(|| cli.logger_db.clone()),
+        )
+    };
     let board: Arc<dyn KanbanBoard> =
-        Arc::new(SqliteKanbanBoard::open(&cli.kanban_db).context("opening kanban board")?);
+        Arc::new(SqliteKanbanBoard::open(&kanban_db).context("opening kanban board")?);
     // The composition root is the only place that names the concrete logger
     // plugin; the rest of the app holds it behind the `CallLogger` trait.
-    let logger: Option<Arc<dyn CallLogger>> = match &cli.logger_db {
+    let logger: Option<Arc<dyn CallLogger>> = match &logger_db {
         Some(p) => Some(Arc::new(
             SqliteCallLogger::open(p).context("opening logger db")?,
         )),
